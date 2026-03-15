@@ -2,9 +2,10 @@ import { NavLink, Outlet } from "react-router";
 
 export default function Layout() {
   const tabs = [
+    { name: "Control", href: "/control" },
     { name: "Monitor", href: "/monitor" },
     { name: "VNC", href: "/vnc" },
-    { name: "QuestDB", href: "/questdb", external: true },
+    { name: "QuestDB", href: "/questdb" },
   ];
 
   return (
@@ -17,39 +18,27 @@ export default function Layout() {
             </div>
             <nav className="flex space-x-8">
               {tabs.map((tab) => (
-                tab.external ? (
-                  <a
-                    key={tab.name}
-                    href={tab.href}
-                    className="inline-flex items-center px-1 pt-1 border-b-2 border-transparent text-sm font-medium text-gray-500 hover:text-gray-700 hover:border-gray-300"
-                  >
-                    {tab.name}
-                  </a>
-                ) : (
-                  <NavLink
-                    key={tab.name}
-                    to={tab.href}
-                    className={({ isActive }) =>
-                      `inline-flex items-center px-1 pt-1 border-b-2 text-sm font-medium ${
-                        isActive
-                          ? "border-brand-600 text-gray-900"
-                          : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
-                      }`
-                    }
-                  >
-                    {tab.name}
-                  </NavLink>
-                )
+                <NavLink
+                  key={tab.name}
+                  to={tab.href}
+                  className={({ isActive }) =>
+                    `inline-flex items-center px-1 pt-1 border-b-2 text-sm font-medium ${
+                      isActive
+                        ? "border-brand-600 text-gray-900"
+                        : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
+                    }`
+                  }
+                >
+                  {tab.name}
+                </NavLink>
               ))}
             </nav>
           </div>
         </div>
       </header>
 
-      <main className="flex-grow">
-        <div className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
-          <Outlet />
-        </div>
+      <main className="flex-grow flex flex-col min-h-0">
+        <Outlet/>
       </main>
     </div>
   );
