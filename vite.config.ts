@@ -7,6 +7,11 @@ export default defineConfig({
   plugins: [tailwindcss(), reactRouter(), tsconfigPaths()],
   server: {
     proxy: {
+      // This is used by the VNC page
+      '/websockify': {
+        target: 'ws://puddle.local/',
+        ws: true,
+      },
       // These two are used by the QuestDB page
       '/questdb/': {
         target: 'http://puddle.local/',
