@@ -1,6 +1,8 @@
 import type { Route } from "./+types/monitor";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as d3 from "d3";
+import { DayPicker } from "react-day-picker";
+import "react-day-picker/style.css";
 
 export function meta({}: Route.MetaArgs) {
   return [
@@ -15,14 +17,11 @@ interface SeriesConfig {
 interface ChartConfig {
   title: string;
   query: string;
-  interval: number;
   series: SeriesConfig[];
   yDomain?: [number | null, number | null];
   initialYDomain?: [number, number];
   yCenterZero?: boolean;
   yLabel?: string;
-  durationSeconds: number;
-  sampleIntervalMs?: number;
   className?: string;
 }
 
@@ -32,6 +31,30 @@ interface QuestDbResponse {
   dataset: [string, ...(number | null)[]][];
   count: number;
 }
+
+interface SelectedRange {
+  start: Date;
+  end: Date;
+}
+
+interface TimelineBin {
+  start: Date;
+  end: Date;
+  dataStart: Date | null;
+  dataEnd: Date | null;
+  isAvailable: boolean;
+  intensity: number;
+}
+
+const DEFAULT_CHART_WIDTH_PX = 400;
+const CHART_PLOT_HORIZONTAL_MARGIN_PX = 65;
+const MIN_AVAILABLE_INTENSITY = 0.18;
+const TIMELINE_ROW_SIZE = 6;
+const LIVE_DURATION_OPTIONS = [
+  { label: "5 min", ms: 5 * 60 * 1000 },
+  { label: "1 hour", ms: 60 * 60 * 1000 },
+  { label: "24 hours", ms: 24 * 60 * 60 * 1000 },
+] as const;
 
 const CHART_COLORS = [
   "#9B111E", // Ruby Red (Primary Brand)
@@ -48,15 +71,15 @@ const DEFAULT_CHARTS: ChartConfig[] = [
   {
     title: "System Temperatures",
     query: `
-      SELECT r.timestamp,
-        r.cpu_thermal_temp / 1000.0,
-        l.drive_temp / 10.0,
-        round((l.motor_temp * (50.0 / 51.0)) - 50.0, 2)
-      FROM rpi_stats_hwmon r ASOF JOIN linmot_stats l
-      WHERE r.timestamp >= $START
+      SELECT l.timestamp,
+        avg(r.cpu_thermal_temp / 1000.0), min(r.cpu_thermal_temp / 1000.0), max(r.cpu_thermal_temp / 1000.0),
+        avg(l.drive_temperature / 10.0), min(l.drive_temperature / 10.0), max(l.drive_temperature / 10.0),
+        avg(round((l.motor_temperature * (50.0 / 51.0)) - 50.0, 2)), min(round((l.motor_temperature * (50.0 / 51.0)) - 50.0, 2)), max(round((l.motor_temperature * (50.0 / 51.0)) - 50.0, 2))
+      FROM puddle_stats l ASOF JOIN rpi_stats_hwmon r
+      WHERE l.timestamp >= $START
+        AND l.timestamp <= $END
+      SAMPLE BY $SAMPLE_BY
     `.replace(/\s+/g, ' ').trim(),
-    interval: 1000,
-    durationSeconds: 5 * 60,
     series: [
       { label: "RPi CPU" },
       { label: "Drive" },
@@ -64,18 +87,17 @@ const DEFAULT_CHARTS: ChartConfig[] = [
     ],
     yDomain: [0, 80],
     yLabel: "Temperature (°C)",
-    sampleIntervalMs: 1000,
   },
   {
     title: "Motor Current",
     query: `
       SELECT timestamp,
-        current / 1000.0
-      FROM linmot_stats
+        avg(motor_current / 1000.0), min(motor_current / 1000.0), max(motor_current / 1000.0)
+      FROM puddle_stats
       WHERE timestamp >= $START
+        AND timestamp <= $END
+      SAMPLE BY $SAMPLE_BY
     `.replace(/\s+/g, ' ').trim(),
-    interval: 250,
-    durationSeconds: 60,
     series: [
       { label: "Current" },
     ],
@@ -83,19 +105,17 @@ const DEFAULT_CHARTS: ChartConfig[] = [
     initialYDomain: [-5, 5],
     yCenterZero: true,
     yLabel: "Amperes (A)",
-    sampleIntervalMs: 10,
   },
   {
     title: "Motor Position",
     query: `
       SELECT timestamp,
-        demand_position / 10000.0,
-        /* actual_position / 10000.0, */
-      FROM linmot_stats
+        avg(demand_position / 10000.0), min(demand_position / 10000.0), max(demand_position / 10000.0)
+      FROM puddle_stats
       WHERE timestamp >= $START
+        AND timestamp <= $END
+      SAMPLE BY $SAMPLE_BY
     `.replace(/\s+/g, ' ').trim(),
-    interval: 250,
-    durationSeconds: 60,
     series: [
       { label: "Demand" },
       // { label: "Actual" },
@@ -103,18 +123,17 @@ const DEFAULT_CHARTS: ChartConfig[] = [
     yDomain: [null, null],
     initialYDomain: [0, 360],
     yLabel: "Position (mm)",
-    sampleIntervalMs: 10,
   },
   {
     title: "Position Accuracy",
     query: `
       SELECT timestamp,
-        (demand_position - actual_position) / 10000.0,
-      FROM linmot_stats
+        avg((demand_position - actual_position) / 10000.0), min((demand_position - actual_position) / 10000.0), max((demand_position - actual_position) / 10000.0)
+      FROM puddle_stats
       WHERE timestamp >= $START
+        AND timestamp <= $END
+      SAMPLE BY $SAMPLE_BY
     `.replace(/\s+/g, ' ').trim(),
-    interval: 250,
-    durationSeconds: 60,
     series: [
       { label: "Offset" },
     ],
@@ -122,18 +141,17 @@ const DEFAULT_CHARTS: ChartConfig[] = [
     initialYDomain: [-2, 2],
     yCenterZero: true,
     yLabel: "Position (mm)",
-    sampleIntervalMs: 10,
   },
   {
     title: "Demand Velocity",
     query: `
       SELECT timestamp,
-        demand_velocity / 1000000.0,
-      FROM linmot_stats
+        avg(demand_velocity / 1000000.0), min(demand_velocity / 1000000.0), max(demand_velocity / 1000000.0)
+      FROM puddle_stats
       WHERE timestamp >= $START
+        AND timestamp <= $END
+      SAMPLE BY $SAMPLE_BY
     `.replace(/\s+/g, ' ').trim(),
-    interval: 250,
-    durationSeconds: 60,
     series: [
       { label: "Demand Velocity" },
     ],
@@ -141,18 +159,17 @@ const DEFAULT_CHARTS: ChartConfig[] = [
     initialYDomain: [-2, 2],
     yCenterZero: true,
     yLabel: "Velocity (m/s)",
-    sampleIntervalMs: 10,
   },
   {
     title: "Demand Acceleration",
     query: `
       SELECT timestamp,
-        demand_acceleration / 100000.0,
-      FROM linmot_stats
+        avg(demand_acceleration / 100000.0), min(demand_acceleration / 100000.0), max(demand_acceleration / 100000.0)
+      FROM puddle_stats
       WHERE timestamp >= $START
+        AND timestamp <= $END
+      SAMPLE BY $SAMPLE_BY
     `.replace(/\s+/g, ' ').trim(),
-    interval: 250,
-    durationSeconds: 60,
     series: [
       { label: "Demand Acceleration" },
     ],
@@ -160,17 +177,134 @@ const DEFAULT_CHARTS: ChartConfig[] = [
     initialYDomain: [-2, 2],
     yCenterZero: true,
     yLabel: "Acceleration (m/s\u00B2)",
-    sampleIntervalMs: 10,
   },
 ];
 
+function roundToNearest(value: number, step: number) {
+  return Math.max(step, Math.round(value / step) * step);
+}
+
+function getQueryBucketMs(range: SelectedRange, plotWidthPx: number) {
+  const rangeMs = Math.max(1, range.end.getTime() - range.start.getTime());
+  const targetMs = Math.max(1, rangeMs / Math.max(1, plotWidthPx));
+
+  if (targetMs < 10) return 1;
+  if (targetMs < 100) return roundToNearest(targetMs, 5);
+  if (targetMs < 1000) return roundToNearest(targetMs, 50);
+  if (targetMs < 60_000) return roundToNearest(targetMs, 1000);
+  return roundToNearest(targetMs, 60_000);
+}
+
+function formatSampleByInterval(bucketMs: number) {
+  if (bucketMs % 3_600_000 === 0) return `${bucketMs / 3_600_000}h`;
+  if (bucketMs % 60_000 === 0) return `${bucketMs / 60_000}m`;
+  if (bucketMs % 1000 === 0) return `${bucketMs / 1000}s`;
+  return `${bucketMs}T`;
+}
+
 export default function Monitor() {
+  const [selectedRange, setSelectedRange] = useState<SelectedRange | null>(null);
+  const [liveDurationMs, setLiveDurationMs] = useState(LIVE_DURATION_OPTIONS[0].ms);
+  const liveDurationMsRef = useRef(LIVE_DURATION_OPTIONS[0].ms);
+  const [liveRange, setLiveRange] = useState<SelectedRange>(() => ({
+    start: new Date(Date.now() - LIVE_DURATION_OPTIONS[0].ms),
+    end: new Date(),
+  }));
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [samplingIntervalMs, setSamplingIntervalMs] = useState(2);
+  const effectiveRange = selectedRange ?? liveRange;
+
+  const handleLiveDurationChange = useCallback((ms: number) => {
+    liveDurationMsRef.current = ms;
+    setLiveDurationMs(ms);
+  }, []);
+
+  const refreshCharts = useCallback(() => {
+    setLiveRange({
+      start: new Date(Date.now() - liveDurationMsRef.current),
+      end: new Date(),
+    });
+    setRefreshKey(k => k + 1);
+  }, []);
+
+  const handleBrushEnd = useCallback((range: SelectedRange) => {
+    setSelectedRange(range);
+  }, []);
+
+  useEffect(() => {
+    const abortController = new AbortController();
+
+    const detectSamplingInterval = async () => {
+      try {
+        const query = 'SELECT timestamp FROM puddle_stats ORDER BY timestamp DESC LIMIT 1000';
+        const response = await fetch('/questdb/exec?' + new URLSearchParams({
+          nm: 'true',
+          query,
+        }), {
+          signal: abortController.signal,
+        });
+
+        if (!response.ok) {
+          console.warn(`Failed to detect sampling interval: ${response.status}`);
+          return;
+        }
+
+        const body: QuestDbResponse = await response.json();
+        const dataset = body.dataset || [];
+
+        if (dataset.length < 10) {
+          console.warn('Not enough samples to detect interval; using default 2ms');
+          return;
+        }
+
+        const timestamps = dataset
+          .map(row => new Date(row[0]).getTime())
+          .sort((a, b) => a - b);
+
+        const deltas: number[] = [];
+        for (let i = 1; i < timestamps.length; i++) {
+          const delta = timestamps[i] - timestamps[i - 1];
+          if (delta > 0) {
+            deltas.push(delta);
+          }
+        }
+
+        if (deltas.length === 0) {
+          console.warn('All timestamps are identical; using default 2ms');
+          return;
+        }
+
+        deltas.sort((a, b) => a - b);
+        const median = deltas[Math.floor(deltas.length / 2)];
+        setSamplingIntervalMs(median);
+        console.log(`Detected sampling interval: ${median}ms`);
+      } catch (err: any) {
+        if (err.name !== 'AbortError') {
+          console.warn('Failed to detect sampling interval:', err);
+        }
+      }
+    };
+
+    detectSamplingInterval();
+
+    return () => {
+      abortController.abort();
+    };
+  }, []);
+
   return (
     <div className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8 w-full">
       <div className="p-6 flex flex-col gap-8">
+        <DateRangeSelector
+          value={selectedRange}
+          onChange={setSelectedRange}
+          onRefresh={refreshCharts}
+          liveDurationMs={liveDurationMs}
+          onLiveDurationChange={handleLiveDurationChange}
+        />
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           {DEFAULT_CHARTS.map((config, idx) => (
-            <Chart key={idx} config={config}/>
+            <Chart key={idx} config={config} range={effectiveRange} refreshKey={refreshKey} onBrushEnd={handleBrushEnd} samplingIntervalMs={samplingIntervalMs}/>
           ))}
         </div>
       </div>
@@ -178,30 +312,580 @@ export default function Monitor() {
   );
 }
 
-function Chart({ config }: { config: ChartConfig }) {
-  const [data, setData] = useState<[number, ...(number | null)[]][]>([]);
+function formatDateKeyLocal(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function startOfLocalDay(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0);
+}
+
+function endOfHourInclusive(date: Date) {
+  return new Date(date.getTime() + (60 * 60 * 1000) - 1);
+}
+
+function rangeLabel(range: SelectedRange | null) {
+  if (!range) return "Live mode";
+  return `${range.start.toLocaleString()} - ${range.end.toLocaleString()}`;
+}
+
+function aggregateValue(value: number | null | undefined) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function computeIntensityMap(entries: [string, number | null][]) {
+  const intensities = new Map<string, number>();
+
+  if (entries.length === 0) {
+    return intensities;
+  }
+
+  const normalizedValues = entries.map(([, value]) => aggregateValue(value));
+  const positiveValues = normalizedValues.filter(value => value > 0);
+
+  if (positiveValues.length === 0) {
+    for (const [key] of entries) {
+      intensities.set(key, 0);
+    }
+    return intensities;
+  }
+
+  const minPositive = Math.min(...positiveValues);
+  const maxPositive = Math.max(...positiveValues);
+  const logMin = Math.log10(minPositive);
+  const logMax = Math.log10(maxPositive);
+
+  for (let i = 0; i < entries.length; i += 1) {
+    const [key] = entries[i];
+    const value = normalizedValues[i];
+
+    if (value <= 0) {
+      intensities.set(key, 0);
+      continue;
+    }
+
+    if (logMin === logMax) {
+      intensities.set(key, 0.7);
+      continue;
+    }
+
+    const normalized = (Math.log10(value) - logMin) / (logMax - logMin);
+    const bounded = Math.max(0, Math.min(1, normalized));
+    intensities.set(key, MIN_AVAILABLE_INTENSITY + bounded * (1 - MIN_AVAILABLE_INTENSITY));
+  }
+
+  return intensities;
+}
+
+function intensityTier(intensity: number) {
+  if (intensity >= 0.82) return 4;
+  if (intensity >= 0.64) return 3;
+  if (intensity >= 0.46) return 2;
+  if (intensity >= 0.28) return 1;
+  return 0;
+}
+
+function createTimelineBins(
+  dayStart: Date,
+  hourlyValues: Map<string, number | null>,
+  hourlyBounds: Map<string, { dataStart: Date | null; dataEnd: Date | null }>,
+  hourlyIntensities: Map<string, number>,
+  rowSize: number,
+) {
+  const totalBins = 24 + 2 * rowSize;
+  const bins: TimelineBin[] = [];
+
+  for (let idx = 0; idx < totalBins; idx += 1) {
+    const hourStart = new Date(dayStart.getTime() + (idx - rowSize) * 60 * 60 * 1000);
+    const key = hourStart.toISOString();
+    const isAvailable = hourlyValues.has(key);
+    const bounds = hourlyBounds.get(key);
+    bins.push({
+      start: hourStart,
+      end: endOfHourInclusive(hourStart),
+      dataStart: bounds?.dataStart ?? null,
+      dataEnd: bounds?.dataEnd ?? null,
+      isAvailable,
+      intensity: isAvailable ? (hourlyIntensities.get(key) ?? 0) : 0,
+    });
+  }
+
+  // Contiguity filter for before-overflow (indices 0..rowSize-1):
+  // Walk backward from the day boundary; any unavailable bin stops the chain.
+  let chain = true;
+  for (let idx = rowSize - 1; idx >= 0; idx -= 1) {
+    if (!bins[idx].isAvailable) chain = false;
+    if (!chain) bins[idx] = { ...bins[idx], isAvailable: false, intensity: 0, dataStart: null, dataEnd: null };
+  }
+
+  // Contiguity filter for after-overflow (indices rowSize+24..totalBins-1):
+  // Walk forward from the day boundary; any unavailable bin stops the chain.
+  chain = true;
+  for (let idx = rowSize + 24; idx < totalBins; idx += 1) {
+    if (!bins[idx].isAvailable) chain = false;
+    if (!chain) bins[idx] = { ...bins[idx], isAvailable: false, intensity: 0, dataStart: null, dataEnd: null };
+  }
+
+  return bins;
+}
+
+function DateRangeSelector({
+  value,
+  onChange,
+  onRefresh,
+  liveDurationMs,
+  onLiveDurationChange,
+}: {
+  value: SelectedRange | null;
+  onChange: (range: SelectedRange | null) => void;
+  onRefresh: () => void;
+  liveDurationMs: number;
+  onLiveDurationChange: (ms: number) => void;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [loadingDays, setLoadingDays] = useState(false);
+  const [loadingTimeline, setLoadingTimeline] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const isFetchingRef = useRef(false);
-  const lastTimestampRef = useRef<string | null>(null);
+  const [availableDayValues, setAvailableDayValues] = useState<Map<string, number | null>>(new Map());
+  const [selectedDay, setSelectedDay] = useState<Date | undefined>(undefined);
+  const [timelineBins, setTimelineBins] = useState<TimelineBin[]>([]);
+  const [pendingStartIndex, setPendingStartIndex] = useState<number | null>(null);
+  const popoverContainerRef = useRef<HTMLDivElement>(null);
+  const dayIntensities = useMemo(
+    () => computeIntensityMap(Array.from(availableDayValues.entries())),
+    [availableDayValues],
+  );
+
+  // Close popover on click outside
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleMouseDown = (event: MouseEvent) => {
+      if (!popoverContainerRef.current?.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleMouseDown);
+    return () => document.removeEventListener("mousedown", handleMouseDown);
+  }, [isOpen]);
 
   useEffect(() => {
     const abortController = new AbortController();
 
-    const fetchData = async () => {
-      if (isFetchingRef.current) return;
-      isFetchingRef.current = true;
-
+    const fetchAvailableDays = async () => {
+      setLoadingDays(true);
       try {
-        let startExpression;
-        if (lastTimestampRef.current) {
-          // Fetch only data newer than the last timestamp received
-          startExpression = `'${lastTimestampRef.current}'`;
-        } else {
-          // First fetch: get the full duration
-          startExpression = `dateadd('s', -${config.durationSeconds}, now())`;
+        const query = `
+          SELECT timestamp, sum(command_position)
+          FROM puddle_stats
+          SAMPLE BY 1d
+        `.replace(/\s+/g, " ").trim();
+
+        const response = await fetch('/questdb/exec?' + new URLSearchParams({
+          nm: 'true',
+          query,
+        }), {
+          signal: abortController.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error(`${response.status} ${response.statusText}`);
         }
 
-        const executableQuery = config.query.replace('$START', startExpression);
+        const body: QuestDbResponse = await response.json();
+        const values = new Map<string, number | null>();
+
+        for (const row of body.dataset || []) {
+          const date = new Date(row[0]);
+          if (!Number.isNaN(date.getTime())) {
+            values.set(formatDateKeyLocal(date), row[1] ?? null);
+          }
+        }
+
+        setAvailableDayValues(values);
+
+        if (values.size > 0) {
+          // SAMPLE BY returns ascending order; take the last row for the newest day
+          const lastRow = body.dataset[body.dataset.length - 1];
+          const newest = lastRow?.[0] ? new Date(lastRow[0]) : null;
+          if (newest && !Number.isNaN(newest.getTime())) {
+            setSelectedDay(prev => prev ?? newest);
+          }
+        }
+
+        setError(null);
+      } catch (err: any) {
+        if (err.name !== "AbortError") {
+          console.error("Error fetching available days:", err);
+          setError(err.message);
+        }
+      } finally {
+        setLoadingDays(false);
+      }
+    };
+
+    fetchAvailableDays();
+
+    return () => {
+      abortController.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedDay) {
+      setTimelineBins([]);
+      return;
+    }
+
+    const abortController = new AbortController();
+
+    const fetchTimeline = async () => {
+      setLoadingTimeline(true);
+
+      try {
+        const dayStart = startOfLocalDay(selectedDay);
+        const windowStart = new Date(dayStart.getTime() - TIMELINE_ROW_SIZE * 60 * 60 * 1000);
+        const windowEnd = new Date(dayStart.getTime() + (24 + TIMELINE_ROW_SIZE) * 60 * 60 * 1000);
+
+        const query = `SELECT timestamp, sum(command_position), min(timestamp), max(timestamp) FROM puddle_stats WHERE timestamp >= '${windowStart.toISOString()}' AND timestamp < '${windowEnd.toISOString()}' SAMPLE BY 1h`;
+
+        const response = await fetch('/questdb/exec?' + new URLSearchParams({
+          nm: 'true',
+          query,
+        }), {
+          signal: abortController.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error(`${response.status} ${response.statusText}`);
+        }
+
+        const body: QuestDbResponse = await response.json();
+        const hourlyValues = new Map<string, number | null>();
+        const hourlyBounds = new Map<string, { dataStart: Date | null; dataEnd: Date | null }>();
+
+        // SAMPLE BY 1h returns one row per UTC hour bucket with aggregate value.
+        // Convert the UTC bucket timestamp to a local-time hour start so it
+        // matches the bins built by createTimelineBins (which uses local time).
+        for (const row of body.dataset || []) {
+          const typedRow = row as unknown as [string, number | null, string | null, string | null];
+          const bucketUtc = new Date(row[0]);
+          if (!Number.isNaN(bucketUtc.getTime())) {
+            const localHourStart = new Date(
+              bucketUtc.getFullYear(),
+              bucketUtc.getMonth(),
+              bucketUtc.getDate(),
+              bucketUtc.getHours(),
+              0,
+              0,
+              0,
+            );
+            const dataStart = typedRow[2] ? new Date(typedRow[2]) : null;
+            const dataEnd = typedRow[3] ? new Date(typedRow[3]) : null;
+            hourlyValues.set(localHourStart.toISOString(), typedRow[1] ?? null);
+            hourlyBounds.set(localHourStart.toISOString(), {
+              dataStart: dataStart && !Number.isNaN(dataStart.getTime()) ? dataStart : null,
+              dataEnd: dataEnd && !Number.isNaN(dataEnd.getTime()) ? dataEnd : null,
+            });
+          }
+        }
+
+        const hourlyIntensities = computeIntensityMap(Array.from(hourlyValues.entries()));
+        setTimelineBins(createTimelineBins(dayStart, hourlyValues, hourlyBounds, hourlyIntensities, TIMELINE_ROW_SIZE));
+        setPendingStartIndex(null);
+        onChange(null);
+        setError(null);
+      } catch (err: any) {
+        if (err.name !== "AbortError") {
+          console.error("Error fetching timeline:", err);
+          setError(err.message);
+        }
+      } finally {
+        setLoadingTimeline(false);
+      }
+    };
+
+    fetchTimeline();
+
+    return () => {
+      abortController.abort();
+    };
+  }, [selectedDay, onChange]);
+
+  const dayHasData = useCallback((date: Date) => {
+    return availableDayValues.has(formatDateKeyLocal(date));
+  }, [availableDayValues]);
+
+  const dayTier = useCallback((date: Date) => {
+    const key = formatDateKeyLocal(date);
+    const intensity = dayIntensities.get(key);
+    if (intensity === undefined) return -1;
+    if (intensity === 0) return 5;
+    return intensityTier(intensity);
+  }, [dayIntensities]);
+
+  const selectedIndexRange = useMemo(() => {
+    if (!value) return null;
+
+    let startIndex = -1;
+    let endIndex = -1;
+
+    for (let idx = 0; idx < timelineBins.length; idx += 1) {
+      const bin = timelineBins[idx];
+      if (startIndex === -1 && value.start >= bin.start && value.start <= bin.end) {
+        startIndex = idx;
+      }
+      if (value.end >= bin.start && value.end <= bin.end) {
+        endIndex = idx;
+      }
+    }
+
+    if (startIndex === -1 || endIndex === -1) return null;
+    return [Math.min(startIndex, endIndex), Math.max(startIndex, endIndex)] as const;
+  }, [timelineBins, value]);
+
+  const handleBinClick = useCallback((index: number) => {
+    const candidate = timelineBins[index];
+    if (!candidate?.isAvailable) {
+      return;
+    }
+
+    if (pendingStartIndex === null) {
+      setPendingStartIndex(index);
+      return;
+    }
+
+    const start = Math.min(pendingStartIndex, index);
+    const end = Math.max(pendingStartIndex, index);
+
+    for (let idx = start; idx <= end; idx += 1) {
+      if (!timelineBins[idx].isAvailable) {
+        setPendingStartIndex(index);
+        return;
+      }
+    }
+
+    onChange({
+      start: timelineBins[start].dataStart ?? timelineBins[start].start,
+      end: timelineBins[end].dataEnd ?? timelineBins[end].end,
+    });
+    setPendingStartIndex(null);
+    setIsOpen(false);
+  }, [onChange, pendingStartIndex, timelineBins]);
+
+  const activeOption = LIVE_DURATION_OPTIONS.find(o => o.ms === liveDurationMs) ?? LIVE_DURATION_OPTIONS[0];
+  const rangeDisplay = value ? rangeLabel(value) : `Live: last ${activeOption.label}`;
+
+  return (
+    <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-base font-semibold text-gray-700">Time Range</h2>
+          <p className="text-sm text-gray-500">{rangeDisplay}</p>
+        </div>
+        <div className="flex items-center gap-3">
+          {/* Live duration pills */}
+          <div className="flex items-center gap-1 rounded-lg border border-gray-200 p-1">
+            <span className="px-2 text-xs text-gray-400 font-medium select-none">Live</span>
+            {LIVE_DURATION_OPTIONS.map(opt => (
+              <button
+                key={opt.ms}
+                type="button"
+                onClick={() => {
+                  onLiveDurationChange(opt.ms);
+                  onChange(null);
+                  setPendingStartIndex(null);
+                  onRefresh();
+                }}
+                className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors ${
+                  liveDurationMs === opt.ms && !value
+                    ? "bg-gray-800 text-white"
+                    : "text-gray-600 hover:bg-gray-100"
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Historical date picker popover */}
+          <div className="relative" ref={popoverContainerRef}>
+            <button
+              type="button"
+              onClick={() => setIsOpen(open => !open)}
+              className={`px-3 py-2 text-sm font-medium border rounded-lg hover:bg-gray-50 ${
+                isOpen || value ? "border-gray-800 bg-gray-50" : "border-gray-300"
+              }`}
+            >
+              {value ? "Historical ▾" : "Select date ▾"}
+            </button>
+            {isOpen && (
+              <div className="absolute right-0 top-full mt-1 z-50 bg-white rounded-xl shadow-xl border border-gray-200 p-4 flex gap-4 min-w-max">
+                {/* Calendar column */}
+                <div>
+                  {loadingDays ? (
+                    <div className="w-[280px] flex items-center justify-center h-48 text-sm text-gray-500">
+                      Loading available days...
+                    </div>
+                  ) : (
+                    <DayPicker
+                      mode="single"
+                      selected={selectedDay}
+                      onSelect={setSelectedDay}
+                      disabled={(date) => !dayHasData(date)}
+                      modifiers={{
+                        levelZero: (date) => dayTier(date) === 5,
+                        level0: (date) => dayTier(date) === 0,
+                        level1: (date) => dayTier(date) === 1,
+                        level2: (date) => dayTier(date) === 2,
+                        level3: (date) => dayTier(date) === 3,
+                        level4: (date) => dayTier(date) === 4,
+                      }}
+                      modifiersClassNames={{
+                        levelZero: "rdp-day_level-zero",
+                        level0: "rdp-day_level-0",
+                        level1: "rdp-day_level-1",
+                        level2: "rdp-day_level-2",
+                        level3: "rdp-day_level-3",
+                        level4: "rdp-day_level-4",
+                      }}
+                    />
+                  )}
+                </div>
+
+                {/* Hour grid column */}
+                <div className="flex flex-col justify-center">
+                  {loadingTimeline ? (
+                    <div className="flex-1 flex items-center justify-center text-sm text-gray-500 w-59">
+                      Loading hours...
+                    </div>
+                  ) : timelineBins.length === 0 ? (
+                    <div className="flex-1 flex items-center justify-center text-sm text-gray-500 w-59">
+                      Select a day to view hours.
+                    </div>
+                  ) : (
+                    <>
+                      <p className="text-xs text-gray-500 mb-2">Click a start hour, then an end hour.</p>
+                      <div className="grid grid-cols-6 gap-1">
+                        {timelineBins.map((bin, idx) => {
+                          const isOverflow = idx < TIMELINE_ROW_SIZE || idx >= TIMELINE_ROW_SIZE + 24;
+                          const isInSelectedRange = selectedIndexRange
+                            ? idx >= selectedIndexRange[0] && idx <= selectedIndexRange[1]
+                            : false;
+                          const isPending = pendingStartIndex === idx;
+                          const hour = String(bin.start.getHours()).padStart(2, "0");
+                          // Overflow cells with no selectable data are hidden but keep grid space
+                          if (isOverflow && !bin.isAvailable) {
+                            return <div key={bin.start.toISOString()} className="h-9 w-9" />;
+                          }
+                          const levelClass = !bin.isAvailable
+                            ? "border-gray-200 bg-gray-100 text-gray-300 cursor-not-allowed"
+                            : bin.intensity === 0
+                              ? `timeline-level-zero hover:brightness-95 ${isOverflow ? "opacity-60" : ""}`
+                              : `timeline-level-${intensityTier(bin.intensity)} hover:brightness-95 ${isOverflow ? "opacity-60" : ""}`;
+                          return (
+                            <button
+                              key={bin.start.toISOString()}
+                              type="button"
+                              onClick={() => handleBinClick(idx)}
+                              title={`${bin.start.toLocaleString()} – ${bin.end.toLocaleTimeString()}`}
+                              disabled={!bin.isAvailable}
+                              className={`h-9 w-9 rounded-sm border flex items-center justify-center font-mono ${levelClass} ${isInSelectedRange ? "ring-2 ring-red-500" : ""} ${isPending ? "ring-2 ring-blue-500" : ""}`}
+                            >
+                              <span className="text-[11px]">{hour}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {error && (
+        <div className="mt-3 rounded-md border border-red-200 bg-red-50 text-red-700 px-3 py-2 text-sm">
+          {error}
+        </div>
+      )}
+
+      <style>{`
+        .rdp-day_level-zero > .rdp-day_button { background-color: #f3f4f6; color: #6b7280; font-weight: 600; }
+        .rdp-day_level-0 > .rdp-day_button { background-color: #fff1f2; color: #881337; font-weight: 600; }
+        .rdp-day_level-1 > .rdp-day_button { background-color: #ffe4e6; color: #881337; font-weight: 600; }
+        .rdp-day_level-2 > .rdp-day_button { background-color: #fecdd3; color: #881337; font-weight: 600; }
+        .rdp-day_level-3 > .rdp-day_button { background-color: #fda4af; color: #7f1d1d; font-weight: 600; }
+        .rdp-day_level-4 > .rdp-day_button { background-color: #fb7185; color: #7f1d1d; font-weight: 700; }
+
+        .timeline-level-zero { border-color: #d1d5db; background-color: #f9fafb; color: #6b7280; }
+        .timeline-level-0 { border-color: #fecdd3; background-color: #fff1f2; color: #881337; }
+        .timeline-level-1 { border-color: #fda4af; background-color: #ffe4e6; color: #881337; }
+        .timeline-level-2 { border-color: #fb7185; background-color: #fecdd3; color: #881337; }
+        .timeline-level-3 { border-color: #f43f5e; background-color: #fda4af; color: #7f1d1d; }
+        .timeline-level-4 { border-color: #e11d48; background-color: #fb7185; color: #7f1d1d; }
+
+        .brush .selection {
+          fill: #9B111E;
+          fill-opacity: 0.15;
+          stroke: #9B111E;
+          stroke-width: 1px;
+        }
+      `}</style>
+    </div>
+  );
+}
+
+function Chart({ config, range, refreshKey, onBrushEnd, samplingIntervalMs }: { config: ChartConfig; range: SelectedRange; refreshKey: number; onBrushEnd?: (range: SelectedRange) => void; samplingIntervalMs: number }) {
+  const [data, setData] = useState<[number, ...(number | null)[]][]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [plotWidthPx, setPlotWidthPx] = useState(DEFAULT_CHART_WIDTH_PX);
+  const frameRef = useRef<HTMLDivElement>(null);
+  const requestIdRef = useRef(0);
+
+  useEffect(() => {
+    if (!frameRef.current) return;
+
+    const resizeObserver = new ResizeObserver((entries) => {
+      if (entries.length === 0) return;
+      const nextWidth = Math.max(1, Math.round(entries[0].contentRect.width - CHART_PLOT_HORIZONTAL_MARGIN_PX));
+      setPlotWidthPx((currentWidth) => currentWidth === nextWidth ? currentWidth : nextWidth);
+    });
+
+    resizeObserver.observe(frameRef.current);
+
+    return () => {
+      resizeObserver.disconnect();
+    };
+  }, []);
+
+  const queryBucketMs = useMemo(() => {
+    const rawBucket = getQueryBucketMs(range, plotWidthPx);
+    return Math.max(samplingIntervalMs, rawBucket);
+  }, [range, plotWidthPx, samplingIntervalMs]);
+  const sampleByInterval = useMemo(() => formatSampleByInterval(queryBucketMs), [queryBucketMs]);
+
+  useEffect(() => {
+    const abortController = new AbortController();
+    const requestId = requestIdRef.current + 1;
+    requestIdRef.current = requestId;
+
+    const fetchData = async () => {
+      setIsLoading(true);
+
+      try {
+        const startExpression = `'${range.start.toISOString()}'`;
+        const endExpression = `'${range.end.toISOString()}'`;
+
+        const executableQuery = config.query
+          .replace('$START', startExpression)
+          .replace('$END', endExpression)
+          .replace('$SAMPLE_BY', sampleByInterval);
 
         const response = await fetch('/questdb/exec?' + new URLSearchParams({
           nm: 'true',
@@ -217,49 +901,45 @@ function Chart({ config }: { config: ChartConfig }) {
         const body: QuestDbResponse = await response.json();
         const rawDataset = body.dataset || [];
 
-        if (rawDataset.length > 0) {
-          lastTimestampRef.current = rawDataset[rawDataset.length - 1][0];
+        const newDataset = rawDataset.map(row => [
+          new Date(row[0]).getTime(),
+          ...row.slice(1)
+        ] as [number, ...(number | null)[]]);
 
-          const newDataset = rawDataset.map(row => [
-            new Date(row[0]).getTime(),
-            ...row.slice(1)
-          ] as [number, ...(number | null)[]]);
-
-          setData((prevData) => {
-            const combined = [...prevData, ...newDataset];
-
-            // Client-side pruning: remove data points older than durationSeconds
-            const cutoff = Date.now() - (config.durationSeconds * 1000);
-            return combined.filter(row => row[0] >= cutoff);
-          });
+        if (requestId === requestIdRef.current) {
+          setData(newDataset);
+          setError(null);
         }
-
-        setError(null);
       } catch (err: any) {
-        if (err.name !== 'AbortError') {
+        if (err.name !== 'AbortError' && requestId === requestIdRef.current) {
           console.error('Error fetching data:', err);
           setError(err.message);
         }
       } finally {
-        isFetchingRef.current = false;
+        if (requestId === requestIdRef.current) {
+          setIsLoading(false);
+        }
       }
     };
 
     fetchData();
-    const interval = setInterval(fetchData, config.interval);
 
     return () => {
-      clearInterval(interval);
       abortController.abort();
     };
-  }, [config.query, config.interval, config.durationSeconds]);
+  }, [config.query, range, refreshKey, sampleByInterval]);
 
   return (
     <div className="flex flex-col gap-4">
       <h2 className="text-lg font-semibold text-gray-700 px-1">{config.title}</h2>
-      <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 overflow-hidden relative">
+      <div ref={frameRef} className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 overflow-hidden relative">
+        {isLoading && (
+          <div className="absolute top-3 right-3 z-10 pointer-events-none rounded-full border border-gray-200 bg-white/90 px-2.5 py-1 text-xs font-medium text-gray-600 shadow-sm">
+            Loading...
+          </div>
+        )}
         {error && (
-          <div className="absolute z-10 left-0 right-0">
+          <div className="absolute z-10 left-0 right-0 pointer-events-none">
             <div
               className="mx-auto w-1/2 rounded-md bg-red-50 border border-red-200 text-red-700 px-4 py-3 shadow-lg text-sm font-medium text-center">
               {error}
@@ -273,8 +953,9 @@ function Chart({ config }: { config: ChartConfig }) {
           initialYDomain={config.initialYDomain}
           yCenterZero={config.yCenterZero}
           yLabel={config.yLabel}
-          durationSeconds={config.durationSeconds}
-          sampleIntervalMs={config.sampleIntervalMs}
+          gapThresholdMs={queryBucketMs}
+          fixedTimeRange={range}
+          onBrushEnd={onBrushEnd}
           className="h-64"
         />
         <div className="mt-4 flex flex-wrap gap-6 justify-center text-sm font-medium">
@@ -298,9 +979,10 @@ interface LineChartProps {
   initialYDomain?: [number, number];
   yCenterZero?: boolean;
   yLabel?: string;
-  durationSeconds: number;
-  sampleIntervalMs?: number;
+  gapThresholdMs: number;
   className?: string;
+  fixedTimeRange: SelectedRange;
+  onBrushEnd?: (range: SelectedRange) => void;
 }
 
 function LineChart({
@@ -310,35 +992,28 @@ function LineChart({
                      initialYDomain = [0, 100],
                      yCenterZero = false,
                      yLabel,
-                     durationSeconds,
-                     sampleIntervalMs,
-                     className = "h-64"
+                     gapThresholdMs,
+                     className = "h-64",
+                     fixedTimeRange,
+                     onBrushEnd,
                    }: LineChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
   const chartIdRef = useRef(`chart-${Math.random().toString(36).slice(2, 11)}`);
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
+  const xScaleRef = useRef<d3.ScaleTime<number, number> | null>(null);
+  const brushGRef = useRef<d3.Selection<SVGGElement, unknown, null, undefined> | null>(null);
+  const onBrushEndRef = useRef(onBrushEnd);
+  useEffect(() => { onBrushEndRef.current = onBrushEnd; }, [onBrushEnd]);
 
   // Constants
   const fadeMargin = 5;
   const margin = { top: 5, left: 45, bottom: 20, right: 20 };
 
-  // Refs for D3 objects to use in animation loop
-  const xRef = useRef<d3.ScaleTime<number, number> | null>(null);
-  const yRef = useRef<d3.ScaleLinear<number, number> | null>(null);
-  const dataRef = useRef(data);
-  const seriesRef = useRef(series);
 
-  // New refs for animating the reveal of new data
-  const lastDataTimestampRef = useRef<number | null>(null);
-  const virtualTimeRef = useRef<number | null>(null);
-
-  // Refs for animating the Y-axis domain
-  const targetYDomainRef = useRef<[number, number]>([0, 100]);
-  const currentYDomainRef = useRef<[number, number]>([0, 100]);
 
   const processedData = useMemo(() => {
-    if (!sampleIntervalMs || data.length < 2) return data;
+    if (data.length < 2) return data;
 
     const result: [number, ...(number | null)[]][] = [];
     for (let i = 0; i < data.length; i++) {
@@ -346,36 +1021,15 @@ function LineChart({
         const prevTime = data[i - 1][0];
         const currTime = data[i][0];
 
-        // If the gap is significantly larger than the interval (e.g., 1.5x)
-        if (currTime - prevTime > sampleIntervalMs * 1.5) {
-          // Insert a null-valued entry to break the line
-          const breakTime = prevTime + sampleIntervalMs;
+        if (currTime - prevTime > gapThresholdMs * 1.5) {
+          const breakTime = prevTime + gapThresholdMs;
           result.push([breakTime, ...new Array(data[i].length - 1).fill(null)]);
         }
       }
       result.push(data[i]);
     }
     return result;
-  }, [data, sampleIntervalMs]);
-
-  useEffect(() => {
-    if (processedData.length > 0) {
-      const lastPoint = processedData[processedData.length - 1];
-      const lastPointTime = lastPoint[0];
-
-      if (lastDataTimestampRef.current === null) {
-        // Initial load: start virtual time at the last point's time
-        virtualTimeRef.current = lastPointTime;
-      }
-
-      lastDataTimestampRef.current = lastPointTime;
-    }
-    dataRef.current = processedData;
-  }, [processedData]);
-
-  useEffect(() => {
-    seriesRef.current = series;
-  }, [series]);
+  }, [data, gapThresholdMs]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -399,17 +1053,35 @@ function LineChart({
     y: d3.ScaleLinear<number, number>,
     innerWidth: number,
     innerHeight: number,
-    now: number
+    xDomainStart: number,
+    xDomainEnd: number,
   ) => {
     // X-axis scale (extended for fading)
-    const timePerPixel = (durationSeconds * 1000) / innerWidth;
+    const domainDurationMs = Math.max(1, xDomainEnd - xDomainStart);
+    const timePerPixel = domainDurationMs / innerWidth;
     const xAxisScale = d3.scaleTime()
-      .domain([now - (durationSeconds * 1000) - (fadeMargin * timePerPixel), now + (fadeMargin * timePerPixel)])
+      .domain([xDomainStart - (fadeMargin * timePerPixel), xDomainEnd + (fadeMargin * timePerPixel)])
       .range([-fadeMargin, innerWidth + fadeMargin]);
 
     const xAxis = d3.axisBottom(xAxisScale)
       .ticks(Math.max(2, Math.floor(innerWidth / 80)))
       .tickFormat(d3.timeFormat("%H:%M:%S") as any);
+
+    const yTickCount = Math.max(2, Math.floor(innerHeight / 40));
+    const yTicks = y.ticks(yTickCount);
+
+    const yGrid = d3.axisLeft(y)
+      .tickValues(yTicks)
+      .tickSize(-innerWidth)
+      .tickFormat(() => "");
+
+    const yGridG = g.select<SVGGElement>(".y-grid").call(yGrid);
+
+    yGridG.selectAll("line")
+      .attr("stroke", "#9ca3af")
+      .attr("stroke-opacity", 0.2)
+      .attr("shape-rendering", "crispEdges");
+    yGridG.select(".domain").attr("display", "none");
 
     const xAxisG = g.select<SVGGElement>(".x-axis")
       .attr("transform", `translate(0,${innerHeight})`)
@@ -435,7 +1107,7 @@ function LineChart({
     });
 
     // Y-axis
-    g.select<SVGGElement>(".y-axis").call(d3.axisLeft(y));
+    g.select<SVGGElement>(".y-axis").call(d3.axisLeft(y).tickValues(yTicks));
 
     // Major X-axis line at y(0)
     const xMajor = g.select<SVGLineElement>("line.x-axis-major");
@@ -446,39 +1118,42 @@ function LineChart({
       .attr("x2", innerWidth)
       .attr("y1", yPos)
       .attr("y2", yPos);
-  }, [durationSeconds]);
+  }, []);
 
   const updatePaths = useCallback((
+    envelopeGroup: d3.Selection<SVGGElement, unknown, null, undefined>,
     seriesGroup: d3.Selection<SVGGElement, unknown, null, undefined>,
     x: d3.ScaleTime<number, number>,
-    y: d3.ScaleLinear<number, number>
+    y: d3.ScaleLinear<number, number>,
+    renderData: [number, ...(number | null)[]][]
   ) => {
-    const currentData = dataRef.current;
-    if (currentData.length === 0) return;
+    if (renderData.length === 0) return;
 
-    const virtualTime = virtualTimeRef.current || Date.now();
+    // Envelope areas (min/max band)
+    const area = d3.area<[number, ...(number | null)[]]>()
+      .x(d => x(d[0]));
 
-    // Find the index of the first point that is > virtualTime using binary search
-    let low = 0;
-    let high = currentData.length;
-    while (low < high) {
-      const mid = (low + high) >>> 1;
-      if (currentData[mid][0] <= virtualTime) low = mid + 1;
-      else high = mid;
-    }
-    const visibleData = currentData.slice(0, low);
-    if (visibleData.length === 0) return;
+    envelopeGroup.selectAll<SVGPathElement, SeriesConfig>("path").each(function (_, i) {
+      const avgIdx = 1 + 3 * i;
+      const minIdx = 2 + 3 * i;
+      const maxIdx = 3 + 3 * i;
+      area
+        .defined(d => typeof d[avgIdx] === 'number' && typeof d[minIdx] === 'number' && typeof d[maxIdx] === 'number')
+        .y0(d => y(d[minIdx] as number))
+        .y1(d => y(d[maxIdx] as number));
+      d3.select(this).attr("d", area(renderData));
+    });
 
-    // Create line generator once per frame and update its x/y scales
+    // Avg lines
     const line = d3.line<[number, ...(number | null)[]]>()
       .x(d => x(d[0]));
 
     seriesGroup.selectAll<SVGPathElement, SeriesConfig>("path").each(function (this: SVGPathElement, _, i) {
-      const idx = i + 1;
-      line.defined(d => typeof d[idx] === 'number')
-        .y(d => y(d[idx] as number));
-
-      d3.select(this).attr("d", line(visibleData));
+      const avgIdx = 1 + 3 * i;
+      line
+        .defined(d => typeof d[avgIdx] === 'number')
+        .y(d => y(d[avgIdx] as number));
+      d3.select(this).attr("d", line(renderData));
     });
   }, []);
 
@@ -497,6 +1172,7 @@ function LineChart({
         .attr("class", "container")
         .attr("transform", `translate(${margin.left},${margin.top})`);
 
+      g.append("g").attr("class", "y-grid");
       g.append("g").attr("class", "x-axis text-[10px] font-medium");
       g.append("line").attr("class", "x-axis-major").attr("stroke", "currentColor");
       g.append("g").attr("class", "y-axis text-[10px] font-medium");
@@ -520,10 +1196,15 @@ function LineChart({
         .attr("clip-path", `url(#${chartIdRef.current}-clip)`);
 
       seriesContainer.append("g")
+        .attr("class", "envelope");
+
+      seriesContainer.append("g")
         .attr("class", "series")
         .attr("fill", "none")
         .attr("stroke-width", 1.5)
         .attr("stroke-linejoin", "round");
+
+      brushGRef.current = g.append("g").attr("class", "brush");
     }
 
     g.select<SVGRectElement>(`#${chartIdRef.current}-clip rect`)
@@ -534,6 +1215,14 @@ function LineChart({
       g.select<SVGTextElement>(".y-axis-label")
         .attr("x", -innerHeight / 2);
     }
+
+    const envelopeGroup = g.select<SVGGElement>(".envelope");
+    envelopeGroup.selectAll<SVGPathElement, SeriesConfig>("path")
+      .data(series)
+      .join("path")
+      .attr("fill", (_, i) => CHART_COLORS[i % CHART_COLORS.length])
+      .attr("fill-opacity", 0.15)
+      .attr("stroke", "none");
 
     const seriesGroup = g.select<SVGGElement>(".series");
     seriesGroup.selectAll<SVGPathElement, SeriesConfig>("path")
@@ -568,85 +1257,36 @@ function LineChart({
       return [yMin as number, yMax as number];
     };
 
-    const targetYDomain = calculateYDomain();
-    targetYDomainRef.current = targetYDomain;
+    const yDomainComputed = calculateYDomain();
 
-    // Initialize currentYDomainRef if it hasn't been set yet
-    if (currentYDomainRef.current[0] === 0 && currentYDomainRef.current[1] === 100) {
-      currentYDomainRef.current = [...targetYDomain];
+    const xDomainStart = fixedTimeRange.start.getTime();
+    const xDomainEnd = fixedTimeRange.end.getTime();
+    const x = d3.scaleTime().domain([xDomainStart, xDomainEnd]).range([0, innerWidth]);
+    const y = d3.scaleLinear().domain(yDomainComputed).range([innerHeight, 0]);
+
+    updateAxes(g, y, innerWidth, innerHeight, xDomainStart, xDomainEnd);
+    updatePaths(envelopeGroup, seriesGroup, x, y, processedData);
+
+    xScaleRef.current = x;
+    if (brushGRef.current) {
+      const brush = d3.brushX<unknown>()
+        .extent([[0, 0], [innerWidth, innerHeight]])
+        .on("end", (event: d3.D3BrushEvent<unknown>) => {
+          if (!event.selection) return;
+          const [x0, x1] = event.selection as [number, number];
+          const brushPixels = Math.abs(x1 - x0);
+          if (brushPixels < 10) return;
+          const scale = xScaleRef.current;
+          if (!scale) return;
+          const start = scale.invert(x0);
+          const end = scale.invert(x1);
+          onBrushEndRef.current?.({ start, end });
+          brushGRef.current!.call(brush.move, null);
+        });
+      brushGRef.current.call(brush);
     }
 
-    const now = Date.now();
-    const x = d3.scaleTime().domain([now - (durationSeconds * 1000), now]).range([0, innerWidth]);
-    const y = d3.scaleLinear().domain(currentYDomainRef.current).range([innerHeight, 0]);
-
-    xRef.current = x;
-    yRef.current = y;
-
-    updateAxes(g, y, innerWidth, innerHeight, now);
-    updatePaths(seriesGroup, x, y);
-
-  }, [data, series, yDomain, dimensions, durationSeconds, initialYDomain, yCenterZero, updateAxes, updatePaths]);
-
-  useEffect(() => {
-    if (!svgRef.current || dimensions.width === 0 || dimensions.height === 0) return;
-
-    const innerWidth = dimensions.width - margin.left - margin.right;
-    const innerHeight = dimensions.height - margin.top - margin.bottom;
-    const svg = d3.select(svgRef.current);
-    const g = svg.select<SVGGElement>("g.container");
-    const seriesGroup = g.select<SVGGElement>(".series");
-
-    let rafId: number;
-    let lastTick = Date.now();
-
-    const animate = () => {
-      const now = Date.now();
-      const deltaTime = now - lastTick;
-      lastTick = now;
-
-      // Advance virtual time
-      if (virtualTimeRef.current !== null && lastDataTimestampRef.current !== null) {
-        if (virtualTimeRef.current < lastDataTimestampRef.current) {
-          // If we're behind the data, catch up (revealing points smoothly)
-          // Speed up slightly if we're far behind to ensure we eventually catch up
-          const catchUpFactor = (lastDataTimestampRef.current - virtualTimeRef.current > 5000) ? 2 : 1;
-          virtualTimeRef.current += deltaTime * catchUpFactor;
-
-          if (virtualTimeRef.current > lastDataTimestampRef.current) {
-            virtualTimeRef.current = lastDataTimestampRef.current;
-          }
-        } else {
-          // If we're caught up, track current time
-          virtualTimeRef.current = lastDataTimestampRef.current;
-        }
-      }
-
-      const x = d3.scaleTime()
-        .domain([now - (durationSeconds * 1000), now])
-        .range([0, innerWidth]);
-
-      xRef.current = x;
-
-      // Interpolate Y-axis domain
-      const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
-      const t = 1 - Math.pow(0.01, deltaTime / 1000); // Smooth interpolation over ~1s
-
-      currentYDomainRef.current[0] = lerp(currentYDomainRef.current[0], targetYDomainRef.current[0], t);
-      currentYDomainRef.current[1] = lerp(currentYDomainRef.current[1], targetYDomainRef.current[1], t);
-
-      const y = d3.scaleLinear().domain(currentYDomainRef.current).range([innerHeight, 0]);
-      yRef.current = y;
-
-      updateAxes(g, y, innerWidth, innerHeight, now);
-      updatePaths(seriesGroup, x, y);
-
-      rafId = requestAnimationFrame(animate);
-    };
-
-    rafId = requestAnimationFrame(animate);
-    return () => cancelAnimationFrame(rafId);
-  }, [dimensions, durationSeconds, updateAxes, updatePaths]);
+  }, [data, processedData, series, yDomain, dimensions, fixedTimeRange, initialYDomain, yCenterZero, updateAxes, updatePaths]);
 
   return (
     <div ref={containerRef} className={`w-full relative ${className}`}>

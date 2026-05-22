@@ -15,6 +15,7 @@
     "d3": "^7.9.0",
     "isbot": "^5.1.31",
     "react": "^19.2.4",
+    "react-day-picker": "^9.11.1",
     "react-dom": "^19.2.4",
     "react-router": "7.12.0"
   },

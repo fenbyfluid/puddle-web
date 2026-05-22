@@ -7,6 +7,11 @@ export default defineConfig({
   plugins: [tailwindcss(), reactRouter(), tsconfigPaths()],
   server: {
     proxy: {
+      // The Puddle websocket
+      '/ws': {
+        target: 'ws://puddle.local/',
+        ws: true,
+      },
       // This is used by the VNC page
       '/websockify': {
         target: 'ws://puddle.local/',
